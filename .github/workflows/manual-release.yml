@@ -1,83 +1,74 @@
 name: Manual release
 
 on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Commit SHA / branch / existing tag to build from"
-        required: true
-      tag:
-        description: "New tag name (leave empty to use existing tag in ref)"
-        required: false
-
-permissions:
-  contents: write   # tag push + release 作成に必要
+  push:
+    tags:
+      - '*'
 
 jobs:
-  build-release:
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ubuntu: "14.04"
+            image: "ubuntu:14.04"
+            infix: "openssl1.0"
+            cxxflags: "-std=c++11"
+          - ubuntu: "18.04"
+            image: "ubuntu:18.04"
+            infix: "openssl1.1"
+            cxxflags: "-std=c++11"
+          - ubuntu: "24.04"
+            image: "ubuntu:24.04"
+            infix: "openssl3"
 
     steps:
       - name: Checkout source ref
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
-
       - name: Setup Zig
         uses: Rul1an/zig-cross-compile-action@v1
         with:
           version: 0.12.0
           target: x86_64-linux-gnu.2.3
-      - name: Setup build deps
+      - name: Setup build deps (host)
         run: |
-          sudo apt update
-          sudo apt install -y libboost-dev
           git clone https://github.com/ge9/zig-gcc-wrapper "$RUNNER_TEMP/zig-gcc-wrapper"
-          echo "$RUNNER_TEMP/zig-gcc-wrapper" >> "$GITHUB_PATH"
-      - name: Build
+      - name: Build on Ubuntu ${{ matrix.ubuntu }}
         run: |
-          zigmake 2.4
-      - name: Decide tag name
-        id: vars
-        run: |
-          REF=${{ inputs.ref }}
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "TAG=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            case $REF in
-                ????????????????????????????????????????) # length=40, maybe commit hash
-                    echo $REF
-                    REF1=commit-${REF%${REF#???????}}
-                    echo $REF1
-                    ;;
-                *)
-                    REF1=$REF
-                    echo "CREATE_TAG=no" >> "$GITHUB_OUTPUT"
-                    ;;
-            esac
-            echo "TAG=$REF1" >> "$GITHUB_OUTPUT"
-          fi
+          docker run --rm \
+            -v "$PWD:/src" \
+            -v "$(dirname "$(which zig)"):/opt/zig" \
+            -v "$RUNNER_TEMP/zig-gcc-wrapper:/opt/zig-gcc-wrapper" \
+            -w /src \
+            ${{ matrix.image }} \
+            bash -euxc '
+              export PATH=/opt/zig:/opt/zig-gcc-wrapper:$PATH
+              apt update
+              apt install -y build-essential libssl-dev libboost-dev
+              CXXFLAGS="${{ matrix.cxxflags }}" zigmake 2.4
+              strip stunserver stunclient stuntestcode
+              tar czvf stunserver-${{ github.ref_name }}-${{ matrix.infix }}.tar.gz \
+                stunserver stunclient stuntestcode
+            '
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.ubuntu }}
+          path: stunserver-${{ github.ref_name }}-${{ matrix.infix }}.tar.gz
+          retention-days: 1
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
-      - name: Create and push tag
-        if: steps.vars.outputs.CREATE_TAG != 'no'
-        run: |
-          git tag "${{ steps.vars.outputs.TAG }}"
-          git push origin "${{ steps.vars.outputs.TAG }}"
-
-      - name: Checkout tag
-        run: |
-          git checkout "${{ steps.vars.outputs.TAG }}"
-
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.vars.outputs.TAG }}
-          name: Release ${{ steps.vars.outputs.TAG }}
-          draft: false
-          prerelease: false
-          files: |
-            stunserver
-            stunclient
-            stuntestcode
-            
+          files: dist/**/*
